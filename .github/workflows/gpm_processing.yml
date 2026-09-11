@@ -1,0 +1,28 @@
+name: Arabian Shield GPM Processing
+
+on:
+  workflow_dispatch:
+
+jobs:
+  spatial-processing:
+    runs-on: ubuntu-latest
+
+    steps:
+      - name: Checkout Repository
+        uses: actions/checkout@v4
+
+      - name: Install Spatial Tools
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y gdal-bin python3-gdal python3-numpy python3-scipy
+
+      - name: Run Lineament Extraction & Distance Transform
+        run: python3 process_gpm.py
+
+      - name: Upload Processed Evidence Rasters
+        uses: actions/upload-artifact@v4
+        with:
+          name: gpm-structural-rasters
+          path: |
+            lineament_distance.tif
+            lineament_density.tif
