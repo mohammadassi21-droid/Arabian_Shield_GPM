@@ -1,9 +1,13 @@
 import csv
 import os
 
+import matplotlib
+matplotlib.use("Agg")
+import matplotlib.pyplot as plt
 import numpy as np
 from osgeo import gdal, ogr
 from scipy import ndimage
+from scipy import stats
 
 
 def open_slope_raster():
@@ -35,17 +39,17 @@ def write_geotiff(path, array, geotransform, projection, data_type):
 def validate_gold_prospectivity(raster_path, vector_path):
     if not os.path.exists(vector_path):
         print(f"Notice: validation vector '{vector_path}' not found; skipping mineral occurrence validation.")
-        return
+        return None
 
     raster = gdal.Open(raster_path, gdal.GA_ReadOnly)
     if raster is None:
         print(f"Notice: could not open raster '{raster_path}' for validation; skipping mineral occurrence validation.")
-        return
+        return None
 
     vector_data = ogr.Open(vector_path)
     if vector_data is None:
         print(f"Notice: could not open vector '{vector_path}' for validation; skipping mineral occurrence validation.")
-        return
+        return None
 
     band = raster.GetRasterBand(1)
     array = band.ReadAsArray().astype(np.float32)
@@ -57,7 +61,7 @@ def validate_gold_prospectivity(raster_path, vector_path):
     layer = vector_data.GetLayer()
     if layer is None:
         print(f"Notice: vector layer in '{vector_path}' is empty; skipping mineral occurrence validation.")
-        return
+        return None
 
     for feature_idx, feature in enumerate(layer):
         geom = feature.GetGeometryRef()
@@ -101,7 +105,7 @@ def validate_gold_prospectivity(raster_path, vector_path):
             writer.writerow(["min", ""])
             writer.writerow(["max", ""])
             writer.writerow(["p75", ""])
-        return
+        return []
 
     values = np.array([record["prospectivity_value"] for record in records], dtype=np.float32)
     summary = {
@@ -128,6 +132,92 @@ def validate_gold_prospectivity(raster_path, vector_path):
             writer.writerow([key, value])
 
     print(f"Validated {len(records)} gold occurrence points; summary saved to gold_prospectivity_validation.csv")
+    return values
+
+
+def evaluate_roc_auc(raster_path, positive_values, geotransform, projection):
+    if positive_values is None or len(positive_values) == 0:
+        print("Notice: no positive occurrence values available for ROC/AUC evaluation; skipping model assessment.")
+        return None
+
+    raster = gdal.Open(raster_path, gdal.GA_ReadOnly)
+    if raster is None:
+        print(f"Notice: could not open '{raster_path}' for ROC/AUC evaluation; skipping model assessment.")
+        return None
+
+    data = raster.GetRasterBand(1).ReadAsArray().astype(np.float32)
+    valid_data = data[np.isfinite(data)]
+    if valid_data.size == 0:
+        print("Notice: raster contains no valid pixels for ROC/AUC evaluation; skipping model assessment.")
+        return None
+
+    n_pos = len(positive_values)
+    rng = np.random.default_rng(42)
+    rows, cols = data.shape
+    row_idx = rng.integers(0, rows, size=n_pos)
+    col_idx = rng.integers(0, cols, size=n_pos)
+    negative_values = np.array([
+        float(data[row_idx[i], col_idx[i]]) for i in range(n_pos)
+    ], dtype=np.float32)
+
+    positive_scores = np.asarray(positive_values, dtype=np.float32)
+    negative_scores = np.asarray(negative_values, dtype=np.float32)
+    labels = np.concatenate([np.ones(len(positive_scores), dtype=int), np.zeros(len(negative_scores), dtype=int)])
+    scores = np.concatenate([positive_scores, negative_scores])
+
+    sorted_indices = np.argsort(scores)
+    scores_sorted = scores[sorted_indices]
+    labels_sorted = labels[sorted_indices]
+
+    thresholds = np.unique(scores_sorted)
+    tpr = []
+    fpr = []
+    for threshold in thresholds:
+        predicted_positive = scores >= threshold
+        tp = np.sum(predicted_positive & (labels == 1))
+        fp = np.sum(predicted_positive & (labels == 0))
+        fn = np.sum((~predicted_positive) & (labels == 1))
+        tn = np.sum((~predicted_positive) & (labels == 0))
+        tpr_value = tp / (tp + fn) if (tp + fn) > 0 else 0.0
+        fpr_value = fp / (fp + tn) if (fp + tn) > 0 else 0.0
+        tpr.append(tpr_value)
+        fpr.append(fpr_value)
+
+    if len(tpr) > 1:
+        tpr = np.asarray(tpr)
+        fpr = np.asarray(fpr)
+        auc_score = float(np.trapz(tpr, fpr))
+    else:
+        auc_score = 0.5
+
+    fig, ax = plt.subplots(figsize=(7, 7), dpi=300)
+    ax.plot(fpr, tpr, label=f"ROC curve (AUC = {auc_score:.3f})", color="darkorange", linewidth=2)
+    ax.plot([0, 1], [0, 1], linestyle="--", color="navy", linewidth=1)
+    ax.set_xlabel("False Positive Rate")
+    ax.set_ylabel("True Positive Rate")
+    ax.set_title("Fuzzy Structural Overlay ROC Evaluation")
+    ax.legend(loc="lower right")
+    ax.grid(alpha=0.3)
+    fig.tight_layout()
+    fig.savefig("roc_curve_evaluation.png", dpi=300)
+    plt.close(fig)
+
+    positive_mean = float(np.mean(positive_scores)) if positive_scores.size > 0 else 0.0
+    negative_mean = float(np.mean(negative_scores)) if negative_scores.size > 0 else 0.0
+    summary_lines = [
+        f"AUC: {auc_score:.6f}",
+        f"Mean prospectivity at gold occurrences: {positive_mean:.6f}",
+        f"Mean prospectivity at random background points: {negative_mean:.6f}",
+        f"Median prospectivity at gold occurrences: {float(np.median(positive_scores)):.6f}",
+        f"Median prospectivity at background points: {float(np.median(negative_scores)):.6f}",
+        f"Positive samples: {len(positive_scores)}",
+        f"Background samples: {len(negative_scores)}",
+    ]
+    with open("model_performance_summary.txt", "w", encoding="utf-8") as summary_file:
+        summary_file.write("\n".join(summary_lines) + "\n")
+
+    print(f"ROC/AUC evaluation complete. AUC={auc_score:.6f}; summary saved to model_performance_summary.txt")
+    return auc_score
 
 
 def main():

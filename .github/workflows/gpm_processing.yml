@@ -35,3 +35,5 @@ jobs:
             fuzzy_lineament_density.tif
             fuzzy_structural_overlay.tif
             gold_prospectivity_validation.csv
+            roc_curve_evaluation.png
+            model_performance_summary.txt
