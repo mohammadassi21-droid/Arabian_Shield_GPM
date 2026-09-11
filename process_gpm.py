@@ -1,48 +1,66 @@
+import os
+
 import numpy as np
 from osgeo import gdal
-from scipy.ndimage import distance_transform_edt, uniform_filter
+from scipy import ndimage
 
-print("Opening slope.tif...")
-ds = gdal.Open("slope.tif")
-if ds is None:
-    raise FileNotFoundError("slope.tif not found in repository root!")
 
-band = ds.GetRasterBand(1)
-slope = band.ReadArray()
+def open_slope_raster():
+    candidate_paths = ["slope.tif", "slope"]
+    for path in candidate_paths:
+        if os.path.exists(path):
+            dataset = gdal.Open(path, gdal.GA_ReadOnly)
+            if dataset is not None:
+                return dataset
+    raise FileNotFoundError("No slope raster found. Expected 'slope.tif' or 'slope'.")
 
-# 1. Extract structural edge pixels (slope > 8 degrees for steep scarps/wadis)
-print("Extracting structural edge pixels...")
-edges = np.where(slope > 8, 1, 0).astype(np.uint8)
 
-# 2. Calculate Euclidean Distance (Distance to Lineaments in meters)
-print("Calculating Euclidean Distance...")
-dist_pixels = distance_transform_edt(edges == 0)
-dist_meters = (dist_pixels * 30.0).astype(np.float32)  # 30m SRTM pixel size
-
-# 3. Calculate Lineament Density (Focal moving window sum / ~2000m radius)
-print("Calculating Lineament Density...")
-density = uniform_filter(edges.astype(np.float32), size=67)
-
-# Helper function to write GeoTIFF rasters with spatial references
-def save_raster(filename, data_array, reference_ds):
+def write_geotiff(path, array, geotransform, projection, data_type):
+    rows, cols = array.shape
     driver = gdal.GetDriverByName("GTiff")
-    out_ds = driver.Create(
-        filename, 
-        reference_ds.RasterXSize, 
-        reference_ds.RasterYSize, 
-        1, 
-        gdal.GDT_Float32
+    output = driver.Create(path, cols, rows, 1, data_type)
+    if output is None:
+        raise RuntimeError(f"Failed to create output raster: {path}")
+
+    output.SetGeoTransform(geotransform)
+    output.SetProjection(projection)
+
+    band = output.GetRasterBand(1)
+    band.WriteArray(array)
+    band.FlushCache()
+    output = None
+
+
+def main():
+    dataset = open_slope_raster()
+    band = dataset.GetRasterBand(1)
+    slope_array = band.ReadAsArray().astype(np.float32)
+    geotransform = dataset.GetGeoTransform()
+    projection = dataset.GetProjection()
+
+    mask = np.isfinite(slope_array) & (slope_array > 8.0)
+    structural_edges = mask.astype(np.uint8)
+
+    distance_from_edges = ndimage.distance_transform_edt(~structural_edges.astype(bool)) * 30.0
+    lineament_density = ndimage.uniform_filter(structural_edges.astype(np.float32), size=67)
+
+    write_geotiff(
+        "lineament_distance.tif",
+        distance_from_edges.astype(np.float32),
+        geotransform,
+        projection,
+        gdal.GDT_Float32,
     )
-    out_ds.SetGeoTransform(reference_ds.GetGeoTransform())
-    out_ds.SetProjection(reference_ds.GetProjection())
-    out_ds.GetRasterBand(1).WriteArray(data_array)
-    out_ds.FlushCache()
-    out_ds = None
+    write_geotiff(
+        "lineament_density.tif",
+        lineament_density.astype(np.float32),
+        geotransform,
+        projection,
+        gdal.GDT_Float32,
+    )
 
-print("Exporting lineament_distance.tif...")
-save_raster("lineament_distance.tif", dist_meters, ds)
+    dataset = None
 
-print("Exporting lineament_density.tif...")
-save_raster("lineament_density.tif", density, ds)
 
-print("Processing complete! Ready for download.")
+if __name__ == "__main__":
+    main()

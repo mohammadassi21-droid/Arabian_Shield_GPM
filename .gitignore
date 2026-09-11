@@ -1,7 +1,0 @@
-07_remote_sensing/
-08_dem/
-*.tif
-*.tiff
-*.zip
-__pycache__/
-.ipynb_checkpoints/

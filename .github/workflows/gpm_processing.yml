@@ -7,22 +7,24 @@ on:
       - main
 
 jobs:
-  spatial-processing:
+  process:
     runs-on: ubuntu-latest
 
     steps:
-      - name: Checkout Repository
+      - name: Checkout repository
         uses: actions/checkout@v4
+        with:
+          lfs: true
 
-      - name: Install Spatial Tools
+      - name: Install system dependencies
         run: |
           sudo apt-get update
           sudo apt-get install -y gdal-bin python3-gdal python3-numpy python3-scipy
 
-      - name: Run Lineament Extraction & Distance Transform
+      - name: Run GPM processing
         run: python3 process_gpm.py
 
-      - name: Upload Processed Evidence Rasters
+      - name: Upload structural raster outputs
         uses: actions/upload-artifact@v4
         with:
           name: gpm-structural-rasters
