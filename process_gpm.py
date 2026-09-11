@@ -44,6 +44,13 @@ def main():
     distance_from_edges = ndimage.distance_transform_edt(~structural_edges.astype(bool)) * 30.0
     lineament_density = ndimage.uniform_filter(structural_edges.astype(np.float32), size=67)
 
+    density_nonzero = lineament_density[lineament_density > 0]
+    density_mean = np.mean(density_nonzero) if density_nonzero.size > 0 else 0.0
+    fuzzy_density = 1.0 / (1.0 + (density_mean / (lineament_density + 1e-6)) ** 2)
+
+    dist_mean = np.mean(distance_from_edges)
+    fuzzy_distance = 1.0 / (1.0 + (distance_from_edges / (dist_mean + 1e-6)) ** 2)
+
     write_geotiff(
         "lineament_distance.tif",
         distance_from_edges.astype(np.float32),
@@ -54,6 +61,20 @@ def main():
     write_geotiff(
         "lineament_density.tif",
         lineament_density.astype(np.float32),
+        geotransform,
+        projection,
+        gdal.GDT_Float32,
+    )
+    write_geotiff(
+        "fuzzy_lineament_density.tif",
+        fuzzy_density.astype(np.float32),
+        geotransform,
+        projection,
+        gdal.GDT_Float32,
+    )
+    write_geotiff(
+        "fuzzy_lineament_distance.tif",
+        fuzzy_distance.astype(np.float32),
         geotransform,
         projection,
         gdal.GDT_Float32,
