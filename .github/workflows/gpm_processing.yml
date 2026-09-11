@@ -34,3 +34,4 @@ jobs:
             fuzzy_lineament_distance.tif
             fuzzy_lineament_density.tif
             fuzzy_structural_overlay.tif
+            gold_prospectivity_validation.csv
