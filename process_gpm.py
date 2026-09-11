@@ -51,6 +51,11 @@ def main():
     dist_mean = np.mean(distance_from_edges)
     fuzzy_distance = 1.0 / (1.0 + (distance_from_edges / (dist_mean + 1e-6)) ** 2)
 
+    fuzzy_and = np.minimum(fuzzy_distance, fuzzy_density)
+    fuzzy_or = np.maximum(fuzzy_distance, fuzzy_density)
+    gamma = 0.75
+    fuzzy_gamma = (fuzzy_and ** (1.0 - gamma)) * (fuzzy_or ** gamma)
+
     write_geotiff(
         "lineament_distance.tif",
         distance_from_edges.astype(np.float32),
@@ -75,6 +80,13 @@ def main():
     write_geotiff(
         "fuzzy_lineament_distance.tif",
         fuzzy_distance.astype(np.float32),
+        geotransform,
+        projection,
+        gdal.GDT_Float32,
+    )
+    write_geotiff(
+        "fuzzy_structural_overlay.tif",
+        fuzzy_gamma.astype(np.float32),
         geotransform,
         projection,
         gdal.GDT_Float32,
