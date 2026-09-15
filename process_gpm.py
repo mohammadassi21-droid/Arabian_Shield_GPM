@@ -1,5 +1,7 @@
 import csv
 import os
+import shutil
+from pathlib import Path
 
 import matplotlib
 matplotlib.use("Agg")
@@ -8,13 +10,47 @@ import numpy as np
 from osgeo import gdal, ogr
 from scipy import ndimage
 from scipy import stats
+from sklearn.ensemble import RandomForestClassifier
+from sklearn.metrics import roc_curve, auc
+
+
+SCRIPT_DIR = Path(__file__).resolve().parent
+PROJECT_ROOT = SCRIPT_DIR.parent
+REMOTE_SENSING_DIR = PROJECT_ROOT / "07_remote_sensing"
+
+
+def copy_alteration_rasters_to_root():
+    alteration_files = [
+        "alteration_index.tif",
+        "iser_index.tif",
+        "ccpi_index.tif",
+    ]
+    for filename in alteration_files:
+        source = REMOTE_SENSING_DIR / filename
+        destination = PROJECT_ROOT / filename
+        if not destination.exists():
+            if not source.exists():
+                raise FileNotFoundError(f"Alteration raster not found: {source}")
+            shutil.copy2(source, destination)
+
+
+def find_raster(filename):
+    candidate_paths = [
+        PROJECT_ROOT / filename,
+        REMOTE_SENSING_DIR / filename,
+        SCRIPT_DIR / filename,
+    ]
+    for path in candidate_paths:
+        if path.exists():
+            return path
+    raise FileNotFoundError(f"Could not find raster '{filename}' in the project root or 07_remote_sensing.")
 
 
 def open_slope_raster():
-    candidate_paths = ["slope.tif", "slope"]
+    candidate_paths = [PROJECT_ROOT / "slope.tif", PROJECT_ROOT / "slope", SCRIPT_DIR / "slope.tif", SCRIPT_DIR / "slope"]
     for path in candidate_paths:
-        if os.path.exists(path):
-            dataset = gdal.Open(path, gdal.GA_ReadOnly)
+        if path.exists():
+            dataset = gdal.Open(str(path), gdal.GA_ReadOnly)
             if dataset is not None:
                 return dataset
     raise FileNotFoundError("No slope raster found. Expected 'slope.tif' or 'slope'.")
@@ -220,7 +256,176 @@ def evaluate_roc_auc(raster_path, positive_values, geotransform, projection):
     return auc_score
 
 
+def load_feature_stack(feature_names):
+    arrays = []
+    valid_mask = None
+    reference_geotransform = None
+    reference_projection = None
+    reference_shape = None
+
+    for filename in feature_names:
+        raster_path = find_raster(filename)
+        dataset = gdal.Open(str(raster_path), gdal.GA_ReadOnly)
+        if dataset is None:
+            raise RuntimeError(f"Could not open feature raster: {raster_path}")
+
+        band = dataset.GetRasterBand(1)
+        array = band.ReadAsArray().astype(np.float32)
+        if reference_shape is None:
+            reference_shape = array.shape
+            reference_geotransform = dataset.GetGeoTransform()
+            reference_projection = dataset.GetProjection()
+        elif array.shape != reference_shape:
+            raise ValueError(f"Feature raster dimensions do not match: {raster_path}")
+
+        band_nodata = band.GetNoDataValue()
+        band_valid = np.isfinite(array)
+        if band_nodata is not None:
+            band_valid &= array != band_nodata
+        valid_mask = band_valid if valid_mask is None else valid_mask & band_valid
+        arrays.append(array)
+        dataset = None
+
+    return (
+        np.stack(arrays, axis=-1),
+        valid_mask,
+        reference_geotransform,
+        reference_projection,
+    )
+
+
+def get_gold_occurrence_pixels(vector_path, geotransform, raster_shape, valid_mask):
+    vector_data = ogr.Open(str(vector_path))
+    if vector_data is None:
+        raise FileNotFoundError(f"Could not open occurrence vector: {vector_path}")
+
+    layer = vector_data.GetLayer()
+    if layer is None:
+        raise ValueError(f"Occurrence vector has no readable layer: {vector_path}")
+
+    rows, cols = raster_shape
+    pixels = set()
+    for feature in layer:
+        geom = feature.GetGeometryRef()
+        if geom is None:
+            continue
+
+        if geom.GetGeometryType() == ogr.wkbPoint:
+            point_geometries = [geom]
+        elif geom.GetGeometryType() == ogr.wkbMultiPoint:
+            point_geometries = [
+                geom.GetGeometryRef(index)
+                for index in range(geom.GetGeometryCount())
+            ]
+        else:
+            point_geometries = []
+
+        for point in point_geometries:
+            if point is None:
+                continue
+            x, y, _ = point.GetPoint()
+            col = int((x - geotransform[0]) / geotransform[1])
+            row = int((y - geotransform[3]) / geotransform[5])
+            if 0 <= row < rows and 0 <= col < cols and valid_mask[row, col]:
+                pixels.add(row * cols + col)
+
+    vector_data = None
+    return np.asarray(sorted(pixels), dtype=np.int64)
+
+
+def run_random_forest(feature_stack, valid_mask, geotransform, projection, occurrence_path, feature_names):
+    rows, cols, feature_count = feature_stack.shape
+    positive_indices = get_gold_occurrence_pixels(
+        occurrence_path,
+        geotransform,
+        (rows, cols),
+        valid_mask,
+    )
+    if positive_indices.size == 0:
+        raise ValueError("No valid gold occurrence pixels were found for Random Forest training.")
+
+    valid_indices = np.flatnonzero(valid_mask.ravel())
+    negative_candidates = np.setdiff1d(valid_indices, positive_indices, assume_unique=False)
+    if negative_candidates.size == 0:
+        raise ValueError("No valid background pixels are available for Random Forest training.")
+
+    rng = np.random.default_rng(42)
+    negative_count = min(positive_indices.size, negative_candidates.size)
+    negative_indices = rng.choice(negative_candidates, size=negative_count, replace=False)
+    sample_indices = np.concatenate([positive_indices, negative_indices])
+    labels = np.concatenate([
+        np.ones(positive_indices.size, dtype=np.uint8),
+        np.zeros(negative_indices.size, dtype=np.uint8),
+    ])
+
+    max_training_samples = 100000
+    if sample_indices.size > max_training_samples:
+        selected = rng.choice(sample_indices.size, size=max_training_samples, replace=False)
+        sample_indices = sample_indices[selected]
+        labels = labels[selected]
+
+    training_features = feature_stack.reshape(-1, feature_count)[sample_indices]
+    model = RandomForestClassifier(
+        n_estimators=500,
+        criterion="gini",
+        oob_score=True,
+        random_state=42,
+        n_jobs=-1,
+    )
+    model.fit(training_features, labels)
+
+    probability_map = np.full((rows, cols), -9999.0, dtype=np.float32)
+    valid_features = feature_stack.reshape(-1, feature_count)[valid_indices]
+    probability_map.ravel()[valid_indices] = model.predict_proba(valid_features)[:, 1]
+    write_geotiff(
+        PROJECT_ROOT / "random_forest_prospectivity.tif",
+        probability_map,
+        geotransform,
+        projection,
+        gdal.GDT_Float32,
+    )
+
+    importance_order = np.argsort(model.feature_importances_)
+    fig, ax = plt.subplots(figsize=(8, 5), dpi=300)
+    ax.barh(
+        np.asarray(feature_names)[importance_order],
+        model.feature_importances_[importance_order],
+        color="steelblue",
+    )
+    ax.set_xlabel("Mean decrease in impurity")
+    ax.set_title("Random Forest Gini Feature Importance")
+    fig.tight_layout()
+    fig.savefig(PROJECT_ROOT / "rf_feature_importance.png", dpi=300)
+    plt.close(fig)
+
+    oob_scores = model.oob_decision_function_[:, 1]
+    finite_oob = np.isfinite(oob_scores)
+    if np.count_nonzero(finite_oob) > 1 and np.unique(labels[finite_oob]).size == 2:
+        false_positive_rate, true_positive_rate, _ = roc_curve(labels[finite_oob], oob_scores[finite_oob])
+        roc_auc = auc(false_positive_rate, true_positive_rate)
+    else:
+        false_positive_rate = np.array([0.0, 1.0])
+        true_positive_rate = np.array([0.0, 1.0])
+        roc_auc = 0.5
+
+    fig, ax = plt.subplots(figsize=(7, 7), dpi=300)
+    ax.plot(false_positive_rate, true_positive_rate, label=f"OOB ROC (AUC = {roc_auc:.3f})", color="darkorange")
+    ax.plot([0, 1], [0, 1], "--", color="navy")
+    ax.set_xlabel("False Positive Rate")
+    ax.set_ylabel("True Positive Rate")
+    ax.set_title("Random Forest ROC Curve")
+    ax.legend(loc="lower right")
+    ax.grid(alpha=0.3)
+    fig.tight_layout()
+    fig.savefig(PROJECT_ROOT / "rf_roc_curve.png", dpi=300)
+    plt.close(fig)
+
+    print(f"Random Forest OOB score: {model.oob_score_:.4f}")
+    print(f"Random Forest outputs saved to {PROJECT_ROOT}")
+
+
 def main():
+    copy_alteration_rasters_to_root()
     dataset = open_slope_raster()
     band = dataset.GetRasterBand(1)
     slope_array = band.ReadAsArray().astype(np.float32)
@@ -246,42 +451,62 @@ def main():
     fuzzy_gamma = (fuzzy_and ** (1.0 - gamma)) * (fuzzy_or ** gamma)
 
     write_geotiff(
-        "lineament_distance.tif",
+        PROJECT_ROOT / "lineament_distance.tif",
         distance_from_edges.astype(np.float32),
         geotransform,
         projection,
         gdal.GDT_Float32,
     )
     write_geotiff(
-        "lineament_density.tif",
+        PROJECT_ROOT / "lineament_density.tif",
         lineament_density.astype(np.float32),
         geotransform,
         projection,
         gdal.GDT_Float32,
     )
     write_geotiff(
-        "fuzzy_lineament_density.tif",
+        PROJECT_ROOT / "fuzzy_lineament_density.tif",
         fuzzy_density.astype(np.float32),
         geotransform,
         projection,
         gdal.GDT_Float32,
     )
     write_geotiff(
-        "fuzzy_lineament_distance.tif",
+        PROJECT_ROOT / "fuzzy_lineament_distance.tif",
         fuzzy_distance.astype(np.float32),
         geotransform,
         projection,
         gdal.GDT_Float32,
     )
     write_geotiff(
-        "fuzzy_structural_overlay.tif",
+        PROJECT_ROOT / "fuzzy_structural_overlay.tif",
         fuzzy_gamma.astype(np.float32),
         geotransform,
         projection,
         gdal.GDT_Float32,
     )
 
-    validate_gold_prospectivity("fuzzy_structural_overlay.tif", "mods_gold_occurrences.geojson")
+    validate_gold_prospectivity(
+        str(PROJECT_ROOT / "fuzzy_structural_overlay.tif"),
+        str(PROJECT_ROOT / "mods_gold_occurrences.geojson"),
+    )
+
+    feature_names = [
+        "lineament_density.tif",
+        "lineament_distance.tif",
+        "alteration_index.tif",
+        "iser_index.tif",
+        "ccpi_index.tif",
+    ]
+    feature_stack, valid_mask, feature_geotransform, feature_projection = load_feature_stack(feature_names)
+    run_random_forest(
+        feature_stack,
+        valid_mask,
+        feature_geotransform,
+        feature_projection,
+        PROJECT_ROOT / "mods_gold_occurrences.geojson",
+        feature_names,
+    )
 
     dataset = None
 
